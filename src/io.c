@@ -1057,6 +1057,113 @@ mrb_io_sync(mrb_state *mrb, mrb_value self)
 }
 
 void
+mrb_fd_set_nonblock(mrb_state *mrb, int fd)
+{
+#if defined(F_GETFL) && defined(F_SETFL) && defined(O_NONBLOCK)
+  int oflags;
+
+  oflags = fcntl(fd, F_GETFL);
+  if (oflags == -1) {
+    mrb_sys_fail(mrb, "fcntl");
+  }
+
+  if ((oflags & O_NONBLOCK) == 0) {
+    oflags |= O_NONBLOCK;
+    if (fcntl(fd, F_SETFL, oflags) == -1) {
+      mrb_sys_fail(mrb, "fcntl");
+    }
+  }
+#endif
+}
+
+mrb_value
+mrb_io_read_nonblock(mrb_state *mrb, mrb_value io)
+{
+  struct mrb_io *fptr;
+  mrb_value buf = mrb_nil_value();
+  mrb_int maxlen;
+  int ret;
+
+  mrb_get_args(mrb, "i|S", &maxlen, &buf);
+  if (maxlen < 0) {
+    return mrb_nil_value();
+  }
+
+  if (mrb_nil_p(buf)) {
+    buf = mrb_str_new(mrb, NULL, maxlen);
+  }
+  if (RSTRING_LEN(buf) != maxlen) {
+    buf = mrb_str_resize(mrb, buf, maxlen);
+  }
+
+  fptr = (struct mrb_io *)mrb_get_datatype(mrb, io, &mrb_io_type);
+  mrb_fd_set_nonblock(mrb, fptr->fd);
+  ret = read(fptr->fd, RSTRING_PTR(buf), maxlen);
+  switch (ret) {
+    case 0: /* EOF */
+      if (maxlen == 0) {
+        buf = mrb_str_new_cstr(mrb, "");
+      } else {
+        mrb_raise(mrb, E_EOF_ERROR, "read_nonblock failed: End of File");
+      }
+      break;
+    case -1: /* Error */
+      {
+        int e = errno;
+        if ((e == EWOULDBLOCK || e == EAGAIN)) {
+          return mrb_symbol_value(mrb_intern_cstr(mrb, "wait_readable"));
+        }
+      }
+      mrb_sys_fail(mrb, "read_nonblock failed");
+      break;
+    default:
+      if (RSTRING_LEN(buf) != ret) {
+        buf = mrb_str_resize(mrb, buf, ret);
+      }
+      break;
+  }
+
+  return buf;
+}
+
+mrb_value
+mrb_io_write_nonblock(mrb_state *mrb, mrb_value io)
+{
+  struct mrb_io *fptr;
+  mrb_value str, buf;
+  int fd, length;
+
+  fptr = (struct mrb_io *)mrb_get_datatype(mrb, io, &mrb_io_type);
+  if (! fptr->writable) {
+    mrb_raise(mrb, E_IO_ERROR, "not opened for writing");
+  }
+
+  mrb_get_args(mrb, "S", &str);
+  if (mrb_type(str) != MRB_TT_STRING) {
+    buf = mrb_funcall(mrb, str, "to_s", 0);
+  } else {
+    buf = str;
+  }
+
+  if (fptr->fd2 == -1) {
+    fd = fptr->fd;
+  } else {
+    fd = fptr->fd2;
+  }
+  mrb_fd_set_nonblock(mrb, fd);
+  length = write(fd, RSTRING_PTR(buf), RSTRING_LEN(buf));
+
+  if (length == -1) {
+    int e = errno;
+    if ((e == EWOULDBLOCK || e == EAGAIN)) {
+      return mrb_symbol_value(mrb_intern_cstr(mrb, "wait_writable"));
+    }
+  }
+
+  return mrb_fixnum_value(length);
+}
+
+void
 mrb_init_io(mrb_state *mrb)
 {
   struct RClass *io;
@@ -1091,6 +1198,8 @@ mrb_init_io(mrb_state *mrb)
   mrb_define_method(mrb, io, "pid",        mrb_io_pid,        MRB_ARGS_NONE());   /* 15.2.20.5.2 */
   mrb_define_method(mrb, io, "fileno",     mrb_io_fileno,     MRB_ARGS_NONE());
 
+  mrb_define_method(mrb, io, "read_nonblock", mrb_io_read_nonblock, MRB_ARGS_ANY());
+  mrb_define_method(mrb, io, "write_nonblock", mrb_io_write_nonblock, MRB_ARGS_REQ(1));
 
   mrb_gv_set(mrb, mrb_intern_cstr(mrb, "$/"), mrb_str_new_cstr(mrb, "\n"));
 }
